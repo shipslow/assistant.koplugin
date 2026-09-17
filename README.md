@@ -1,3 +1,59 @@
+# Fork notes
+
+Fork of [omer-faruq/assistant.koplugin](https://github.com/omer-faruq/assistant.koplugin) (v1.17).
+
+Changes on top of v1.17:
+
+- **Text-protocol web search** (`tool_mode = "text"` on a provider) for endpoints and models
+  without function calling: local models behind Ollama/llama.cpp-style servers, thin proxies,
+  or bridges that ignore the OpenAI `tools` array. In text mode the plugin appends an
+  instruction to the user turn; the model replies with exactly one line `SEARCH: <query>`,
+  the plugin runs the configured search (SearXNG here), appends the results and asks again
+  (max 3 rounds). The instruction sits in the user turn on purpose: backends that wrap the
+  request in their own system prompt make models ignore it when it is in ours.
+  `ToolExecutor.parseTextSearch` is strict (uppercase `SEARCH:` line, at most three short
+  lines) so real answers are not mistaken for search requests.
+- **`features.websearch`** in `configuration.lua` selects the search tool like `provider`
+  selects the model (applied whenever the value changes; the settings menu still works).
+- **SearXNG `max_results`** (default 10): SearXNG returns 30-50 hits, the tail is noise.
+- **Recap**: structured long-form prompt built in (where you are / story so far scaled to
+  progress / recent events / people / open threads), `{time_away}` placeholder from the
+  auto-recap hook, web search off for the recap (the book text is the ground truth).
+- **Reading position context** for recap and X-Ray: the current chapter and the chapter
+  titles reached so far (from the TOC, top two levels) are sent with the book text, and the
+  book-text excerpt states which part of the book it covers (e.g. "the 31% mark to 58%") so
+  the model knows where its own knowledge has to fill in.
+- **Term X-Ray context rebuilt**: upstream feeds the term through a LexRank pass
+  (`assistant_lexrank.lua`, thresholds in `assistant_dictdialog.lua`) whose default thresholds
+  (0.01, 99 % minimum selection, stage 3 adding every remaining candidate) select practically all
+  sentences of the tail-truncated book text; the result is then cut to its *first* 100k
+  characters. So the model got a generic slab of text from the start of the window rather than
+  the passages about the term, and the ranking (a similarity matrix over up to 2,500 sentences,
+  computed on the device CPU) bought nothing. The fork sends the passages that mention the term
+  (5 sentences either side, merged, in book order, language-aware sentence splitting via the
+  same per-language modules); over budget it keeps the first passage (introduction) and the most
+  recent ones, and tells the model how many mentions/passages it is seeing (`{coverage}`).
+  Measured on a Kindle: 0.1 s for 318k characters. `assistant_lexrank.lua` stays in the tree for
+  other uses; the `lexrank_*` config keys no longer affect Term X-Ray.
+- **Prompts reworked**: Ask gets a real role (reading companion, spoiler guard, concise for
+  a small screen); X-Ray, Book info, Annotations, Summary-with-annotations, Explain,
+  Historical context and the AI dictionary are grounded in the book text / title and
+  keep to the reader's position; the dictionary leads with the meaning that fits the
+  sentence; emoji headers removed (e-ink fonts render them as boxes); X-Ray and
+  summary-with-annotations no longer web-search (the book text is the ground truth).
+- **Engine position bug fixed** (upstream): after a book-text extraction crengine's
+  bookmark stays at the start of the range even though the screen still shows the
+  reading page; the next extraction then sees an empty range (and a later
+  `gotoXPointer(that bookmark)` moves the reader to page 1). Only `gotoPage`/`gotoPos`
+  put it right (`ASUtils.saveEnginePosition`/`restoreEnginePosition`, applied around every
+  extraction). Found and verified on device with the HTTP inspector.
+- **Ask framing**: "I have a question about this book" became "my question may be about
+  this book or something else", so off-topic questions are answered instead of queried.
+- **Request cap** for large bodies raised from 120 s to 300 s (`api_handlers/base.lua`):
+  a full-text recap on a large model can take a couple of minutes.
+
+---
+
 # Assistant: AI Helper Plugin for KOReader
 <!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
 [![All Contributors](https://img.shields.io/badge/all_contributors-1-orange.svg?style=flat-square)](#contributors-)
