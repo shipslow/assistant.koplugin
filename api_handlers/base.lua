@@ -484,10 +484,10 @@ function BaseHandler:makeRequest(url, headers, body, timeout, maxtime)
             local request_timeout, request_maxtime
             if body and #body > 10000 then
                 request_timeout = timeout or 300
-                request_maxtime = maxtime or 120
+                request_maxtime = maxtime or 300
             else
                 request_timeout = timeout or 45
-                request_maxtime = maxtime or 120
+                request_maxtime = maxtime or 300
             end
             completed, success, code, content, resp_headers = Trapper:dismissableRunInSubprocess(function()
                     return ASUtils.httpRequest(url, request_timeout, request_maxtime, body, nil, headers)

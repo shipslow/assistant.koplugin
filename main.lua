@@ -703,6 +703,7 @@ function Assistant:init()
 
   -- Sync provider selection from configuration if configuration provider changed
   self:syncProviderSelectionFromConfig()
+  self:syncWebSearchFromConfig()
 
   local model_provider = self.config:getActiveProviderId()
   if not model_provider then
@@ -1344,7 +1345,15 @@ function Assistant:_hookRecap()
           local authors = doc_props:readSetting("authors", "Unknown Author")
           local message = T(_("Do you want an AI Recap?\nFor %1 by %2.\n\n"), title, authors)
                     .. T(N_("Last read an hour ago.", "Last read %1 hours ago.", timeDiffHours), timeDiffHours)
-  
+          -- fork: passed to the recap prompt as {time_away}
+          local time_away
+          if timeDiffHours >= 48 then
+            local days = math.floor(timeDiffHours / 24)
+            time_away = T(N_("%1 day", "%1 days", days), days)
+          else
+            time_away = T(N_("%1 hour", "%1 hours", timeDiffHours), timeDiffHours)
+          end
+
           -- Display the request popup using ConfirmBox.
           UIManager:show(ConfirmBox:new{
             text            = message,
@@ -1353,7 +1362,7 @@ function Assistant:_hookRecap()
               ASUtils.runWhenOnlineFast(function()
                 local showFeatureDialog = require("assistant_featuredialog")
                 Trapper:wrap(function()
-                  showFeatureDialog(assistant, "recap", title, authors, percent_finished)
+                  showFeatureDialog(assistant, "recap", title, authors, percent_finished, nil, { time_away = time_away })
                 end)
               end)
             end,
@@ -1384,6 +1393,28 @@ function Assistant:syncProviderSelectionFromConfig()
     -- Config changed (or first install). Mark config's provider as selected and remember it.
     self.settings:saveSetting("provider", config_provider)
     self.settings:saveSetting("previous_config_ai_provider", config_provider)
+    self.updated = true
+  end
+end
+
+--- fork: `features.websearch = "searxngapi"` in configuration.lua selects the
+--- web search tool the same way `provider` selects the model: applied whenever
+--- the configured value changes, so the choice lives in the config file and
+--- survives a settings purge. The settings menu still works in between.
+function Assistant:syncWebSearchFromConfig()
+  local wanted = self.config and self.config:getFeature("websearch")
+  if type(wanted) ~= "string" or wanted == "" then return end
+  local known = false
+  for _i, key in ipairs(ToolExecutor.SEARCH_API_NAMES) do
+    if key == wanted then known = true break end
+  end
+  if not known then
+    logger.warn("assistant: features.websearch is not a search tool:", wanted)
+    return
+  end
+  if self.settings:readSetting("previous_config_websearch") ~= wanted then
+    self.settings:saveSetting("use_websearch", wanted)
+    self.settings:saveSetting("previous_config_websearch", wanted)
     self.updated = true
   end
 end

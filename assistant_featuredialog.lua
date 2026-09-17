@@ -17,9 +17,11 @@ local extractBookTextForAnalysis = ASUtils.extractBookTextForAnalysis
 local extractHighlightsNotesAndNotebook = ASUtils.extractHighlightsNotesAndNotebook
 local normalizeMarkdownHeadings = ASUtils.normalizeMarkdownHeadings
 
-local function showFeatureDialog(assistant, feature_type, title, author, progress_percent, message_history)
+--- extra (optional table): { time_away = "3 days" } for the {time_away} placeholder.
+local function showFeatureDialog(assistant, feature_type, title, author, progress_percent, message_history, extra)
     local Querier = assistant.querier
     local ui = assistant.ui
+    extra = extra or {}
 
     -- Prefer already-loaded querier; fallback to getActiveProviderId.
     local provider = (assistant.querier and assistant.querier.provider_name
@@ -39,6 +41,7 @@ local function showFeatureDialog(assistant, feature_type, title, author, progres
 
     local formatted_progress_percent = string.format("%.2f", progress_percent * 100)
     local feature_title, loading_message, system_prompt, user_prompt_template, user_prompt_use_websearch, book_text, highlights_notes
+    local book_text_total, chapter_context
 
     local language = assistant.settings:readSetting("response_language") or assistant.ui_language
 
@@ -58,7 +61,7 @@ local function showFeatureDialog(assistant, feature_type, title, author, progres
         book_text = nil
         highlights_notes = nil
         if custom_config.use_book_text and custom_config.use_book_text == true then
-            book_text = extractBookTextForAnalysis(assistant)
+            book_text, book_text_total = extractBookTextForAnalysis(assistant)
         end
         if custom_config.use_highlight_with_notebook and custom_config.use_highlight_with_notebook == true then
             highlights_notes = extractHighlightsNotesAndNotebook(assistant, true)
@@ -135,12 +138,13 @@ local function showFeatureDialog(assistant, feature_type, title, author, progres
         highlights_notes = nil
         if feature_type == "xray" or feature_type == "recap" then
           if assistant.settings:readSetting("use_book_text_for_analysis", false) then
-            book_text = extractBookTextForAnalysis(assistant)
+            book_text, book_text_total = extractBookTextForAnalysis(assistant)
           end
+          chapter_context = ASUtils.getChapterContext(assistant)
         elseif feature_type == "annotations" then
           highlights_notes = extractHighlightsNotesAndNotebook(assistant, true)
         elseif feature_type == "summary_using_annotations" then
-          book_text = extractBookTextForAnalysis(assistant)
+          book_text, book_text_total = extractBookTextForAnalysis(assistant)
           highlights_notes = extractHighlightsNotesAndNotebook(assistant, false)
         end
         -- build effective prompt config for show_suggestions (file override > builtin)
@@ -163,7 +167,27 @@ local function showFeatureDialog(assistant, feature_type, title, author, progres
     
     local book_text_prompt = ""
     if book_text then
-        book_text_prompt = string.format("\n\n[! IMPORTANT !] Here is the book text up to my current position, only consider this text for your response:\n [BOOK TEXT BEGIN]\n%s\n[BOOK TEXT END]", book_text)
+        -- Tell the model how much of the book the (tail-truncated) excerpt covers,
+        -- so it knows where its own knowledge has to fill in.
+        local coverage = " (the complete text from the beginning of the book)"
+        if book_text_total and book_text_total > #book_text and progress_percent > 0 then
+            local from_pct = progress_percent * 100 * (1 - #book_text / book_text_total)
+            coverage = string.format(" (an excerpt covering roughly the %.0f%% mark to the current position at %s%%; everything before it is NOT included)",
+                from_pct, formatted_progress_percent)
+        end
+        book_text_prompt = string.format("\n\n[! IMPORTANT !] Here is the book text up to my current position%s. Treat it as the ground truth for your response:\n [BOOK TEXT BEGIN]\n%s\n[BOOK TEXT END]", coverage, book_text)
+    end
+
+    local chapter_prompt = ""
+    if chapter_context and (chapter_context.current or #chapter_context.read > 0) then
+        local lines = {}
+        if chapter_context.current then
+            table.insert(lines, "Current chapter: " .. chapter_context.current)
+        end
+        if #chapter_context.read > 0 then
+            table.insert(lines, "Chapters reached so far, in order: " .. table.concat(chapter_context.read, " | "))
+        end
+        chapter_prompt = "\n\n[READING POSITION]\n" .. table.concat(lines, "\n") .. "\n[END READING POSITION]"
     end
 
     local highlights_notes_prompt = ""
@@ -183,10 +207,11 @@ local function showFeatureDialog(assistant, feature_type, title, author, progres
       title = title,
       author = author,
       progress = formatted_progress_percent,
-      language = language
+      language = language,
+      time_away = extra.time_away or _("a while"),
     })
 
-    user_content = user_content .. book_text_prompt .. highlights_notes_prompt
+    user_content = user_content .. chapter_prompt .. book_text_prompt .. highlights_notes_prompt
     
     local context_message = {
         role = "user",
@@ -261,6 +286,7 @@ local function showFeatureDialog(assistant, feature_type, title, author, progres
             author = author,
             progress = formatted_progress_percent,
             language = language,
+            time_away = extra.time_away or _("a while"),
             user_input = user_question.user_input or "",
           })
           do

@@ -386,8 +386,10 @@ I have a question about the following highlighted text: ```%s```.
 If the question is not clear enough, analyze the highlighted text.]],
       book.title, book.author, highlighted_text)
   elseif book.title and book.author then
+    -- fork: upstream said "I have a question about this book", which made the
+    -- model second-guess any question that was not about the book.
     head = string.format([[I'm reading something titled '%s' by %s.
-I have a question about this book.]], book.title, book.author)
+My question follows; it may be about this book or about something else.]], book.title, book.author)
   else
     head = string.format([[You are a helpful assistant. I have a question.]])
   end
