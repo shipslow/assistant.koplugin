@@ -173,7 +173,9 @@ function searxng:SearchKeywords(keywords, trap_widget)
 
     local segments = strbuf.new()
     segments:put("## Web Search Results:\n")
+    local max_results = self.max_results or 10 -- SearXNG returns 30-50 hits; the tail is noise
     for i, item in ipairs(parsed.results) do
+        if i > max_results then break end
         segments:put("---")
         segments:putf("### Source %d: %s", i, json_default(item.title, "Untitled"))
         segments:put("* URL: ")

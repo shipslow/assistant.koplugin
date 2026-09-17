@@ -298,11 +298,60 @@ function Querier:query(message_history, title)
     -- the user's configured search provider is used.
     local prompt_websearch   = ASUtils.get_attr(message_history[#message_history], "use_websearch", false)
     local user_setting_ws    = self.settings:readSetting("use_websearch", "none")
+    local ws_mode = (prompt_websearch and user_setting_ws ~= "none") and user_setting_ws or "none"
+
+    -- Text-protocol search: a provider with `tool_mode = "text"` never gets a
+    -- `tools` array on the wire. For endpoints and models without function
+    -- calling (local models, thin proxies, bridges that ignore `tools`) the model
+    -- is instead told it may answer with a single `SEARCH: <query>` line; the
+    -- plugin runs the search itself, appends the results and asks again.
+    local text_search = ws_mode ~= "none" and self:usesTextTools() and ToolExecutor.IsExtSearch(ws_mode)
     local query_option = {
         use_stream_mode = self.settings:readSetting("use_stream_mode", true),
-        use_websearch   = (prompt_websearch and user_setting_ws ~= "none")
-                          and user_setting_ws or "none",
+        use_websearch   = text_search and "none" or ws_mode,
+        text_search     = text_search and ws_mode or nil,
     }
+
+    if not text_search then
+        return self:_queryRaw(message_history, title, query_option)
+    end
+
+    ToolExecutor.ensureTextSearchPrompt(message_history)
+    local rounds = 0
+    while true do
+        local res, err = self:_queryRaw(message_history, title, query_option)
+        if err or type(res) ~= "string" then
+            return res, err
+        end
+        local keywords = ToolExecutor.parseTextSearch(res)
+        if not keywords or rounds >= MAX_TOOL_ROUNDS then
+            return res, err
+        end
+        rounds = rounds + 1
+        local search_ok, search_result = ToolExecutor.executeWebSearch(keywords, ws_mode, self.handler, rounds)
+        if not search_ok then
+            if search_result == self.handler.CODE_CANCELLED then
+                self.user_interrupted = true
+                return nil, _("Request cancelled by user.")
+            end
+            logger.warn("text search failed", tostring(search_result):sub(1, 200))
+            search_result = "The search failed (" .. tostring(search_result) .. "). Answer from your own knowledge."
+        end
+        if rounds >= MAX_TOOL_ROUNDS then
+            search_result = search_result .. Prompts.maximum_tool_use_prompt
+        end
+        ToolExecutor.appendTextSearchResult(message_history, res, keywords, search_result)
+    end
+end
+
+--- True when the active provider is configured with `tool_mode = "text"`.
+function Querier:usesTextTools()
+    return self.provider_setting ~= nil and self.provider_setting.tool_mode == "text"
+end
+
+--- One request to the provider (with the native tool-call loop when the
+--- provider supports function calling).
+function Querier:_queryRaw(message_history, title, query_option)
 
     local is_added_maximum_prompt = false
 
@@ -507,9 +556,10 @@ function Querier:query(message_history, title)
         -- ---------------------------------------------------------------
         -- NON-STREAM PATH  — may loop for tool calls
         -- ---------------------------------------------------------------
-        local tool_notice = T("\n🌐 %1", ToolExecutor.ToolToText(query_option.use_websearch))
+        local ws_label = query_option.text_search or query_option.use_websearch
+        local tool_notice = T("\n🌐 %1", ToolExecutor.ToolToText(ws_label))
         local notify = ASUtils.bold_format(
-            T("<b>%1</b>\n☁️ %2\n⚡ %3%4", title or _("Querying AI ..."), self:getProviderLabel(), self.handler.model, query_option.use_websearch ~= "none" and tool_notice or "")
+            T("<b>%1</b>\n☁️ %2\n⚡ %3%4", title or _("Querying AI ..."), self:getProviderLabel(), self.handler.model, ws_label ~= "none" and tool_notice or "")
         )
         local infomsg = InfoMessage:new{ icon = "book.opened", text = notify }
         UIManager:show(infomsg)

@@ -35,6 +35,9 @@ local CONFIGURATION = {
     --
     provider_settings = {
         openai = {
+            -- tool_mode = "text",  -- for endpoints or models without function calling (local
+                                   -- models, proxies that ignore `tools`): web search then works
+                                   -- through a `SEARCH: <query>` line the model writes.
             default = true,          -- optional, used when `provider` above is not set
             visible = true,          -- optional, if set to false, will not shown in the provider switch
             model = "gpt-5.4-mini",  -- model list: https://platform.openai.com/docs/models
@@ -133,9 +136,10 @@ local CONFIGURATION = {
         },
         searxngapi = {
             -- External Search Tool API: SearXNG, opensource and free, hosted on you own server.
-            -- https://github.com/searxng/searxng
-            base_url = "https://you-searxng-address"
+            -- https://github.com/searxng/searxng  (needs `search.formats: [html, json]` in its settings.yml)
+            base_url = "https://you-searxng-address",
             -- keys not needed
+            max_results = 10, -- fork: how many hits are handed to the model (SearXNG returns 30-50)
         },
         exaapi = {
             -- External Search Tool API: Exa.ai, semantic search for AI agents.
@@ -157,12 +161,18 @@ local CONFIGURATION = {
         ota_github_repo = "omer-faruq/assistant.koplugin", -- GitHub repository for OTA updates
         default_folder_for_logs = nil,         -- Set the default folder for auto saved logs, nil for the same folder as the book, ex: "/mnt/onboard/logs/" for Kobo , "/mnt/us/documents/logs/" for Kindle
         max_text_length_for_analysis = 100000, -- max text length to be used on xray-recap-book analyzes,
+                                               -- fork: ~4 chars per token; 500000 is roughly 125k tokens of book text
+        -- websearch = "searxngapi",           -- fork: select the web search tool from this file (same keys as the
+                                               -- settings menu: none, builtin, serpapi, tavilyapi, exaapi, searxngapi)
         max_page_size_for_analysis = 250,      -- maximum page size to be used on xray-recap-book analyzes (for page-based documents, ex: PDF)
         max_page_context_chars = 6000,         -- max characters of nearby-page text sent as context when "Add Nearby Page Text as Context" is enabled
 
         -- Term X-Ray context expansion settings (for analyzing characters, objects, places, concepts, magic)
         -- NOTE: The following settings are optimized to provide ~40k input tokens per term x-ray lookup, using ~10% of a 400k token context window.
         -- This allows rich analysis of characters, magic systems, plot elements, and relationships in fantasy books.
+        -- fork: Term X-Ray sends the passages that mention the term (first passage +
+        -- the most recent ones within term_xray_max_characters); the lexrank_* keys
+        -- below are no longer used by Term X-Ray.
         term_xray_context_sentences_before = 5, -- Number of sentences to include BEFORE matching sentences for context (captures descriptions, setup)
         term_xray_context_sentences_after = 5,  -- Number of sentences to include AFTER matching sentences for context (captures effects, consequences)
         -- These settings help capture pronouns (he/she/it/that) and narrative context that the LLM needs for complete analysis

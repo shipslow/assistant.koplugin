@@ -107,11 +107,74 @@ function ToolExecutor.SetSearchAPIConfig(assistant)
         if c then
             if c.api_key then tool.api_key = c.api_key end
             if c.base_url then tool.base_url = c.base_url:gsub("/+$", "") end -- trim the ending `/`
+            tool.max_results = tonumber(c.max_results)
         else
             tool.api_key = nil
             tool.base_url = nil -- clear stale if provider deleted
+            tool.max_results = nil
         end
     end
+end
+
+-- ---------------------------------------------------------------------------
+-- Text-protocol search (fork): for providers that cannot do function calling.
+-- The model is asked to reply with a single `SEARCH: <query>` line; the
+-- Querier runs the search and appends the results as a user message.
+-- ---------------------------------------------------------------------------
+
+--- Append the text-search instruction to the last user message (once per
+--- message). It goes in the user turn on purpose: backends that wrap the
+--- request in their own system prompt make the model ignore a search
+--- instruction placed in ours, while the same text in the user turn is followed.
+function ToolExecutor.ensureTextSearchPrompt(message_history)
+    local instruction = require("assistant_prompts").assistant_prompts.text_search_prompt
+    local last = message_history[#message_history]
+    if type(last) ~= "table" or last.role ~= "user" or type(last.content) ~= "string" then
+        return
+    end
+    if not ASUtils.get_attr(last, "text_search_prompt") then
+        last.content = last.content .. instruction
+        ASUtils.set_attr(last, "text_search_prompt", true)
+    end
+end
+
+--- Parse a reply for the text search protocol: a short reply (at most three
+--- non-empty lines, 400 chars) containing a line `SEARCH: <query>`. Smaller
+--- models sometimes prefix the line with "Let me search for this." so the
+--- line does not have to be the first one; a real answer is never this short
+--- with an uppercase SEARCH: line in it.
+--- @return string|nil keywords
+function ToolExecutor.parseTextSearch(text)
+    if type(text) ~= "string" or #text > 400 then return nil end
+    local lines = {}
+    for line in text:gmatch("[^\r\n]+") do
+        if line:match("%S") then table.insert(lines, line) end
+    end
+    if #lines == 0 or #lines > 3 then return nil end
+    for _i, line in ipairs(lines) do
+        local clean = line:gsub("^[%s%*`_#>%-]+", ""):gsub("[%s%*`_]+$", "")
+        local keywords = clean:match("^SEARCH%s*:%s*(.+)$")
+        if keywords then
+            keywords = keywords:gsub("^[%*`_%s\"'“‘]+", ""):gsub("[%*`_%s\"'”’%.]+$", ""):gsub("%s+", " ")
+            if #keywords > 0 and #keywords <= 200 then return keywords end
+            return nil
+        end
+    end
+    return nil
+end
+
+--- Record the model's search request and the results in the history.
+function ToolExecutor.appendTextSearchResult(message_history, assistant_text, keywords, search_result)
+    local call = { role = "assistant", content = assistant_text }
+    ASUtils.set_attr(call, "search_keywords", "⌗ " .. keywords .. "\n\n")
+    table.insert(message_history, call)
+    local result = {
+        role = "user",
+        content = "[WEB SEARCH RESULTS for: " .. keywords .. "]\n" .. tostring(search_result)
+            .. "\n[END OF WEB SEARCH RESULTS]\n\nUsing these results together with your own knowledge, now answer the original request in full. Do not mention the search mechanics.",
+    }
+    ASUtils.set_attr(result, "is_search_result", true)
+    table.insert(message_history, result)
 end
 
 function ToolExecutor.IsExtSearch(key)
