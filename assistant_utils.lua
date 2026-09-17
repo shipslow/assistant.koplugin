@@ -85,17 +85,56 @@ end
 -- utils.PLUGIN_DIR during gettext's load sees a usable value.
 local _ = require("assistant_gettext")
 
+--- fork: remember/put back crengine's position around a text extraction.
+--- getTextFromXPointers (selectRange) and gotoPos leave the engine's bookmark
+--- at the start of the range even after gotoXPointer(current): getXPointer()
+--- then returns the cover, the next extraction sees an empty range, and a
+--- later gotoXPointer(that bookmark) would move the reader to page 1. Only
+--- gotoPage (page mode) / gotoPos (scroll mode) put the bookmark right, which
+--- is also how ReaderRolling itself navigates. Verified on device 2026-09-16.
+function M.saveEnginePosition(ui)
+  local ok, saved = pcall(function()
+    return {
+      page = ui.document:getCurrentPage(),
+      pos = ui.document.getCurrentPos and ui.document:getCurrentPos() or nil,
+      scroll = ui.view ~= nil and ui.view.view_mode == "scroll",
+      xp = ui.document:getXPointer(),
+    }
+  end)
+  return ok and saved or nil
+end
+
+function M.restoreEnginePosition(ui, saved)
+  if not saved then return end
+  pcall(function()
+    if saved.scroll and saved.pos then
+      ui.document:gotoPos(saved.pos)
+    elseif saved.page then
+      ui.document:gotoPage(saved.page)
+    elseif saved.xp then
+      ui.document:gotoXPointer(saved.xp)
+    end
+  end)
+end
+
+--- Returns the text before the reading position (tail-truncated to
+--- features.max_text_length_for_analysis) and, second, the untruncated length
+--- so callers can tell the model how much of the book the excerpt covers.
 function M.extractBookTextForAnalysis(assistant)
     local ui = assistant and assistant.ui
     local book_text = nil
+    local total_len = nil
       if not ui or not ui.document or not ui.document.info then return nil end
       if not ui.document.info.has_pages then
           -- Only extract text for EPUB documents
+          local saved_engine = M.saveEnginePosition(ui)
           local current_xp = ui.document:getXPointer()
           ui.document:gotoPos(0)
           local start_xp = ui.document:getXPointer()
           ui.document:gotoXPointer(current_xp)
           book_text = ui.document:getTextFromXPointers(start_xp, current_xp) or ""
+          M.restoreEnginePosition(ui, saved_engine)
+          total_len = #book_text
           local max_text_length_for_analysis = assistant.config:getFeature("max_text_length_for_analysis", 100000)
           if #book_text > max_text_length_for_analysis then
               book_text = M.truncateToTailUtf8Safe(book_text, max_text_length_for_analysis)
@@ -113,12 +152,136 @@ function M.extractBookTextForAnalysis(assistant)
             buf:put(page_text, "\n")
         end
         book_text = buf:get()
+        total_len = #book_text
         local max_text_length_for_analysis = assistant.config:getFeature("max_text_length_for_analysis", 100000)
         if #book_text > max_text_length_for_analysis then
             book_text = M.truncateToTailUtf8Safe(book_text, max_text_length_for_analysis)
         end
     end
-    return book_text
+    return book_text, total_len
+end
+
+--- Term X-Ray context (fork): every sentence up to the reading position that
+--- mentions `term` (case-insensitive; language stem as fallback), each with
+--- `before`/`after` surrounding sentences, merged into passages in book order.
+--- When the passages exceed max_chars the FIRST passage is kept (where the term
+--- is introduced) and the oldest later passages are dropped, so the most recent
+--- uses near the reader survive. Replaces the LexRank pass, which ranked every
+--- sentence of the book on the device CPU and then kept the first 100k chars.
+--- @return string|nil text, number mentions, number shown_passages, number total_passages
+function M.extractTermMentions(book_text, term, language_code, before, after, max_chars)
+  if type(book_text) ~= "string" or type(term) ~= "string" or term == "" then
+    return nil, 0, 0, 0
+  end
+  before, after = before or 5, after or 5
+  max_chars = max_chars or 100000
+  -- Sentence delimiters and the minimum sentence length come from the
+  -- per-language modules (see LEXRANK_LANGUAGES.md), as in the LexRank path.
+  local LexRankLanguages = require("assistant_lexrank_languages")
+  local lang = LexRankLanguages.get_language_module(language_code)
+  local delimiters = table.concat(lang.sentence_delimiters or { ".", "!", "?", ";" }, "")
+  local min_len = lang.min_sentence_length or 10
+  local escaped = delimiters:gsub("%p", "%%%0")
+  local sentences = {}
+  for sentence in book_text:gmatch("[^" .. escaped .. "\n]+[" .. escaped .. "]?") do
+    sentence = sentence:gsub("^%s+", ""):gsub("%s+$", "")
+    if #sentence >= min_len then table.insert(sentences, sentence) end
+  end
+  if #sentences == 0 then return nil, 0, 0, 0 end
+
+  local function find_matches(needle)
+    local hits = {}
+    for i, sentence in ipairs(sentences) do
+      if sentence:lower():find(needle, 1, true) then table.insert(hits, i) end
+    end
+    return hits
+  end
+  local needle = term:lower():gsub("^%s+", ""):gsub("%s+$", "")
+  local matches = find_matches(needle)
+  if #matches == 0 and LexRankLanguages.stem_word then
+    local stem = LexRankLanguages.stem_word(term, language_code)
+    if type(stem) == "string" and #stem >= 3 and stem ~= needle then
+      matches = find_matches(stem:lower())
+    end
+  end
+  if #matches == 0 then return nil, 0, 0, 0 end
+
+  -- merge windows into passages
+  local passages = {}
+  for _i, idx in ipairs(matches) do
+    local lo, hi = math.max(1, idx - before), math.min(#sentences, idx + after)
+    local last = passages[#passages]
+    if last and lo <= last.hi + 1 then
+      last.hi = math.max(last.hi, hi)
+    else
+      table.insert(passages, { lo = lo, hi = hi })
+    end
+  end
+  for _i, p in ipairs(passages) do
+    p.text = table.concat(sentences, " ", p.lo, p.hi)
+  end
+
+  -- budget: first passage always, then the most recent ones
+  local sep = "\n\n[…]\n\n"
+  local chosen = { passages[1] }
+  local used = #passages[1].text
+  local i = #passages
+  while i > 1 do
+    local len = #passages[i].text + #sep
+    if used + len > max_chars then break end
+    table.insert(chosen, 2, passages[i])
+    used = used + len
+    i = i - 1
+  end
+  local parts = {}
+  for _i, p in ipairs(chosen) do table.insert(parts, p.text) end
+  local text = table.concat(parts, sep)
+  if #text > max_chars then
+    text = M.truncateToTailUtf8Safe(text, max_chars)
+  end
+  return text, #matches, #chosen, #passages
+end
+
+--- Chapter titles reached so far and the current chapter title, from the TOC
+--- (top two levels). Returns nil when the document has no usable TOC.
+--- Long lists keep the first 10 and the most recent entries.
+function M.getChapterContext(assistant, max_entries)
+  local ui = assistant and assistant.ui
+  if not ui or not ui.toc or not ui.document then return nil end
+  local ok, ctx = pcall(function()
+    ui.toc:fillToc()
+    local toc = ui.toc.toc
+    if type(toc) ~= "table" or #toc == 0 then return nil end
+    -- The view's page is what the reader sees; the engine's page can lag
+    -- behind it right after a text extraction.
+    local page = (ui.view and ui.view.state and ui.view.state.page) or ui:getCurrentPage()
+    if not page then return nil end
+    local function clean(title)
+      title = title or ""
+      if ui.toc.cleanUpTocTitle then return ui.toc:cleanUpTocTitle(title) end
+      return title
+    end
+    local read = {}
+    for _i, entry in ipairs(toc) do
+      if entry.page and entry.page <= page and (entry.depth or 1) <= 2 then
+        local title = clean(entry.title)
+        if title ~= "" then table.insert(read, title) end
+      end
+    end
+    local current = clean(ui.toc:getTocTitleByPage(page))
+    return { current = (current ~= "" and current or nil), read = read }
+  end)
+  if not ok or type(ctx) ~= "table" then return nil end
+  max_entries = max_entries or 60
+  if #ctx.read > max_entries then
+    local head, tail = 10, max_entries - 11
+    local trimmed = {}
+    for i = 1, head do trimmed[#trimmed + 1] = ctx.read[i] end
+    trimmed[#trimmed + 1] = "…"
+    for i = #ctx.read - tail + 1, #ctx.read do trimmed[#trimmed + 1] = ctx.read[i] end
+    ctx.read = trimmed
+  end
+  return ctx
 end
 
 function M.extractHighlightsNotesAndNotebook(assistant, include_notebook)
@@ -382,6 +545,7 @@ function M.getPageRangeText(ui, before, after, max_chars)
   else
     -- Reflowable documents: use xpointer ranges (getTextFromXPointers mutates
     -- the view position, so save/restore the xpointer around extraction).
+    local saved_engine = M.saveEnginePosition(ui)
     local saved_xp = ui.document:getXPointer()
     local ok = pcall(function()
       local xp_anchor = ui.document:getPageXPointer(anchor_page)
@@ -396,6 +560,7 @@ function M.getPageRangeText(ui, before, after, max_chars)
     end)
     -- Always restore the view position.
     pcall(function() ui.document:gotoXPointer(saved_xp) end)
+    M.restoreEnginePosition(ui, saved_engine)
     if not ok then
       return ""
     end
@@ -539,6 +704,7 @@ local function getDocumentEndXPointer(ui)
       xp_after_last = xp
     end
   end)
+  local saved_engine = M.saveEnginePosition(ui)
   pcall(function()
     ui.document:gotoPos(2 ^ 30)
     local xp = ui.document:getXPointer()
@@ -550,6 +716,7 @@ local function getDocumentEndXPointer(ui)
   pcall(function()
     if start_xp then ui.document:gotoXPointer(start_xp) end
   end)
+  M.restoreEnginePosition(ui, saved_engine)
 
   local function accepted(xp)
     if not xp or xp == start_xp then
@@ -616,6 +783,7 @@ function M.extractCurrentChapterText(assistant)
     -- position, so save/restore the xpointer around it, as getPageRangeText).
     -- getTextFromXPointers also drives the engine's selection rendering, so
     -- preserve any active text selection alongside the position.
+    local saved_engine = M.saveEnginePosition(ui)
     local saved_xp
     local ok_xp, xp = pcall(function() return ui.document:getXPointer() end)
     if ok_xp then
@@ -649,6 +817,7 @@ function M.extractCurrentChapterText(assistant)
     pcall(function()
       if saved_xp then ui.document:gotoXPointer(saved_xp) end
     end)
+    M.restoreEnginePosition(ui, saved_engine)
     -- Restore the text selection the extraction disturbed. There is no
     -- ReaderHighlight API to re-select, so restore the state table and, for
     -- rolling documents (pos0/pos1 are xpointers), re-issue the engine's own
